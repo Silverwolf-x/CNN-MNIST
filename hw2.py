@@ -29,10 +29,17 @@ UserWarning: (Triggered internally at  ..\torch\csrc\utils\tensor_numpy.cpp:180.
 
 @ v1.1 2023-04-19
 增加了绘制错误分辨图形的可视化展示
+
+这里区分几个概念：
+train: 训练拟合模型。关心loss
+valid: 查看拟合情况，一般要与train进行数据分离。关心loss,acc，有时关心confusion matrix
+test: 上述train & valid完成后的检验，原则上要5折交叉验证。关心acc和confusion matrix
+predict: 单纯的未来预测。只能输出predict
 """
 
 import math
 import os
+from regex import F
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, random_split
@@ -101,99 +108,41 @@ class MyModel(nn.Module):
         return x
 
 
-# def trainer(train_loader, valid_loader, model):
-#     #===prepare===
-#     criterion = torch.nn.CrossEntropyLoss()
-#     optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
-#     best_loss = math.inf
-#     record_train_loss = []
-#     record_valid_loss = []
-#     early_stop_count = 0
-
-#     for epoch in range(config.n_epoches):
-#         #===train mode===
-#         model.train()
-#         loss_record = []
-#         train_loop = tqdm(train_loader, position=0, ncols=100, leave=False)
-#         for x, y in enumerate(train_loop):
-#             x, y = x.to(config.device), y.to(config.device)
-#             y_pred = model(x)
-#             # targets的类型是要求long(int64)，这里对齐
-#             loss = criterion(y_pred, y.long())
-#             # 清零梯度，反向传播，更新权重
-#             optimizer.zero_grad()
-#             loss.backward()
-#             optimizer.step()
-#             # 进度条设置
-#             train_loop.set_description(f'Epoch [{epoch}/{config.n_epoches}]')
-#             train_loop.set_postfix({'loss': loss.item()})
-#             loss_record.append(loss.item())
-#         record_train_loss.append(np.mean(loss_record))
-
-#         #===evaluate mode===
-#         model.eval()
-#         loss_record = []
-#         correct=0
-#         for x, y in valid_loader:
-#             x, y = x.to(config.device), y.to(config.device)
-#             with torch.no_grad():  # 减少内存损耗
-#                 output = model(x)
-#                 loss = criterion(output, y.long())
-#                 pred = torch.max(output, 1)[1]
-#                 correct += pred.eq(y).sum()
-#                 loss_record.append(loss.item())
-#         accuracy=correct/(60000*config.valid_ratio)
-#         record_valid_loss.append(np.mean(loss_record))
-
-#         #===early stopping===
-#         if record_valid_loss[-1] < best_loss:
-#             best_loss = record_valid_loss[-1]
-#             print(f'Now model with loss {best_loss:4f} valid accuracy {accuracy:4f}... from epoch {epoch}')
-#             early_stop_count = 0
-#         else:
-#             early_stop_count += 1
-#         if early_stop_count >= config.early_stop:
-#             print(f'Model is not improving for {config.early_stop} epoches. The last epoch is {epoch}.')
-#             break
-#     # save_path=config.save(config.time+f'model_{loss:.3f}.ckpt')
-#     torch.save(model.state_dict(), config.save_model(best_loss))
-#     print(f'Saving model with loss {best_loss:4f}... from epoch {epoch}')
-#     return record_train_loss, record_valid_loss, best_loss
-
-
-# targets的类型是要求long(int64)，这里对齐
-# 清零梯度，反向传播，更新权重
 def compute_loss_and_acc(
-    model, data_loop, criterion, device, optimizer=None, mode="train"
+    model, data_loop, device, criterion=None, optimizer=None, mode="train"
 ):
     """OUTPUT
-    - `train`: mean_loss\n- `valid`: mean_loss, accuracy\n- `test`: accuracy"""
+    - `train`: mean_loss\n- `valid`: mean_loss, accuracy, predict_list\n- `test`: predict_list"""
     assert mode in ["train", "valid", "test"]
-    total_loss = 0
+    total_loss, correct_preds = 0, 0
+    preds_list = []
 
     for x, y in data_loop:
+        print(f"{len(data_loop.iterable.dataset)=}{len(data_loop)=}")
         x, y = x.to(device), y.to(device)
         output = model(x)
-        loss = criterion(output, y.long())
-        total_loss += loss.item()
-        data_loop.set_postfix({"loss": loss.item()})
 
-        if mode == "train":
+        if mode in ["train", "valid"]:  # loss
+            # targets的类型是要求long(int64)，这里对齐
+            loss = criterion(output, y.long())
+            total_loss += loss.item()
+            data_loop.set_postfix({"loss": loss.item()})
+        if mode == "train":  # 清零梯度，反向传播，更新权重
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-        if mode in ["valid", "test"]:
-            with torch.no_grad():
-                correct_preds = (output.argmax(1) == y).sum().item()
-                accuracy = correct_preds / y.size(0)
-
+        if mode in ["valid", "test"]:  # acc & confusion matrix
+            y_pred = output.argmax(1)
+            correct_preds += (y_pred == y).sum().item()
+            preds_list.extend(y_pred.detach().cpu().numpy())
+            accuracy = correct_preds / len(data_loop)
     mean_loss = total_loss / len(data_loop)
     if mode == "train":
         return mean_loss
     elif mode == "valid":
-        return mean_loss, accuracy
+        return mean_loss, accuracy, preds_list
     else:  # mode == 'test'
-        return accuracy
+        return accuracy, preds_list
 
 
 def trainer(train_loader, valid_loader, model):
@@ -204,6 +153,7 @@ def trainer(train_loader, valid_loader, model):
         "best_loss": math.inf,
         "train_loss": [],
         "valid_loss": [],
+        "valid_pred": None,
         "early_stop_count": 0,
     }
     for epoch in range(config.n_epoches):
@@ -212,7 +162,7 @@ def trainer(train_loader, valid_loader, model):
         train_loop = tqdm(train_loader, position=0, ncols=100, leave=False)
         train_loop.set_description(f"Training | Epoch [{epoch}/{config.n_epoches}]")
         train_loss = compute_loss_and_acc(
-            model, train_loop, criterion, config.device, optimizer, mode="train"
+            model, train_loop, config.device, criterion, optimizer, mode="train"
         )
         stats["train_loss"].append(train_loss)
 
@@ -220,10 +170,12 @@ def trainer(train_loader, valid_loader, model):
         model.eval()
         valid_loop = tqdm(valid_loader, position=0, ncols=100, leave=False)
         valid_loop.set_description(f"Validation | Epoch [{epoch}/{config.n_epoches}]")
-        valid_loss, valid_acc = compute_loss_and_acc(
-            model, valid_loop, criterion, config.device, mode="valid"
-        )
-        stats["valid_loss"].append(valid_loss)
+        with torch.no_grad():
+            valid_loss, valid_acc, valid_pred = compute_loss_and_acc(
+                model, valid_loop, config.device, criterion, mode="valid"
+            )
+            stats["valid_loss"].append(valid_loss)
+            stats["valid_pred"] = valid_pred
 
         # ===early stopping===
         if stats["valid_loss"][-1] < stats["best_loss"]:
@@ -246,21 +198,24 @@ def trainer(train_loader, valid_loader, model):
     return stats
 
 
-def predict(test_data, model):
+def test(test_loader, model):
     """注意这里载入data不是loader一批批载入
     返回pred的值，错误率，错误的坐标"""
     model.eval()
     preds = []
     incorrect_index = []
-    for i, (x, y) in tqdm(enumerate(test_data), position=0, ncols=100):
-        # (B, 28, 28)-->(B, 1, 28, 28)
-        x = torch.unsqueeze(x, dim=1).to(config.device)
-        with torch.no_grad():
-            output = model(x)
-            y_pred = torch.max(output, 1)[1].detach().cpu().numpy()[0]
-            preds.append(y_pred)
-            if y_pred != y:
-                incorrect_index.append(i)
+    test_loop = tqdm(test_loader, position=0, ncols=100, leave=False)
+    test_loop.set_description("Testing | ")
+    with torch.no_grad():
+        test_acc, test_pred = compute_loss_and_acc(
+            model, test_loop, config.device, mode="test"
+        )
+        print(f"{len(test_pred)=}")
+        print(f"{test_pred=}")
+        incorrect_preds = test_pred != test_loader.datasets.targets
+        incorrect_index.extend(
+            i for i, incorrect in enumerate(incorrect_preds) if incorrect
+        )
     return preds, 1 - len(incorrect_index) / len(test_data), incorrect_index
 
 
@@ -334,7 +289,7 @@ class config:
         # -==Important Hyperparameters===
         self.early_stop = 5
         self.learning_rate = 10e-3
-        self.n_epoches = 5
+        self.n_epoches = 1
 
     def save(self, path: str):
         if not os.path.exists(self.folder):
@@ -369,9 +324,10 @@ if __name__ == "__main__":
     train_dataset, valid_dataset = random_split(
         train_data, [n_train, n_valid], torch.Generator().manual_seed(config.seed)
     )
+    test_dataset = test_data
 
     # ======data processing end==
-    train_loader, valid_loader = map(
+    train_loader, valid_loader, test_loader = map(
         lambda data: DataLoader(
             data,
             batch_size=config.batch_size,
@@ -380,8 +336,9 @@ if __name__ == "__main__":
             drop_last=True,
             num_workers=0,
         ),
-        [train_dataset, valid_dataset],
+        [train_dataset, valid_dataset, test_dataset],
     )
+    test_loader = DataLoader(test_dataset)
 
     # ===training===
     model = MyModel().to(config.device)
@@ -394,7 +351,7 @@ if __name__ == "__main__":
         stats["best_loss"],
     )
     # ===plot loss===
-    loss_plot(train_loss, valid_loss)
+    # loss_plot(train_loss, valid_loss)
 
     # ===predict===
     model = MyModel().to(config.device)
@@ -403,7 +360,7 @@ if __name__ == "__main__":
     )
     # 使用之前的model迁移学习
     # model.load_state_dict(torch.load(r'.\run\2023-04-18_22.38_epoch1000_score0.989000_model.ckpt',map_location=config.device),strict=False)
-    preds, accuracy, incorrect_index = predict(test_data, model)
+    preds, accuracy, incorrect_index = test(test_loader, model)
     print(f"test accuracy:{accuracy:4f}")
     os.rename(config.save_model(best_loss), config.save_model(best_loss, accuracy))
 
